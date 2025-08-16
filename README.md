@@ -1,6 +1,11 @@
 # kubexec
 
+
+![Kubekec logo](kubexec-logo.png)
+
 Execute commands and scripts on Kubernetes pods with Docker access.
+
+Designed for use in [CLIMB Notebooks](https://docs.climb.ac.uk/).
 
 ## Installation
 
