@@ -110,6 +110,7 @@ class KubernetesClient:
     def wait_for_job_completion(self, job_name: str, namespace: str = "default", timeout: int = 3600) -> Tuple[int, str]:
         """Wait for job completion and return exit code and logs"""
         start_time = time.time()
+        image_pull_check_done = False
         
         while time.time() - start_time < timeout:
             try:
@@ -121,6 +122,15 @@ class KubernetesClient:
                 elif job.status.failed:
                     logs = self.get_job_logs(job_name, namespace)
                     return 1, logs
+                
+                # Check for image pull issues early
+                if not image_pull_check_done and time.time() - start_time > 30:
+                    pod_status = self._check_pod_image_pull_status(job_name, namespace)
+                    if pod_status == "ImagePullBackOff":
+                        raise JobExecutionError(f"Job {job_name} failed: Cannot pull Docker image. Check image name and registry access.")
+                    elif pod_status == "ErrImagePull":
+                        raise JobExecutionError(f"Job {job_name} failed: Image pull error. Verify image exists and is accessible.")
+                    image_pull_check_done = True
                 
                 time.sleep(2)
                 
@@ -212,3 +222,28 @@ class KubernetesClient:
             raise JobExecutionError("Command execution timed out")
         except Exception as e:
             raise KubernetesClientError(f"Failed to execute in pod: {e}")
+    
+    def _check_pod_image_pull_status(self, job_name: str, namespace: str) -> Optional[str]:
+        """Check if pod has image pull issues"""
+        try:
+            pods = self.core_v1.list_namespaced_pod(
+                namespace=namespace,
+                label_selector=f"job-name={job_name}"
+            )
+            
+            if not pods.items:
+                return None
+            
+            pod = pods.items[0]
+            
+            # Check container status
+            if pod.status.container_statuses:
+                for container_status in pod.status.container_statuses:
+                    if container_status.state.waiting:
+                        return container_status.state.waiting.reason
+            
+            return None
+            
+        except ApiException as e:
+            logger.warning(f"Failed to check pod image pull status: {e}")
+            return None

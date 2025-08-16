@@ -20,7 +20,7 @@ except FileNotFoundError:
 
 setup(
     name="kubexec",
-    version="0.1.0",
+    version="0.6.0",
     author="kubexec team",
     description="Execute commands and scripts on Kubernetes pods with Docker access",
     long_description=long_description,
@@ -42,6 +42,7 @@ setup(
     entry_points={
         "console_scripts": [
             "kubexec=kubexec.cli:main",
+            "kuberlist=kubexec.kuberlist:main",
         ],
     },
 )

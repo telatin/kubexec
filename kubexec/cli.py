@@ -133,6 +133,12 @@ Examples:
         help='Cleanup jobs older than specified hours'
     )
     
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'%(prog)s {__import__("kubexec").__version__}'
+    )
+    
     return parser
 
 

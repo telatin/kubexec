@@ -2,7 +2,7 @@
 kubexec - Execute commands and scripts on Kubernetes pods with Docker access
 """
 
-__version__ = "0.1.0"
+__version__ = "0.6.0"
 __author__ = "kubexec team"
 
 from .cli import main
