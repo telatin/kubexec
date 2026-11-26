@@ -161,10 +161,10 @@ def main() -> int:
         
         # Handle special operations
         if args.list_jobs:
-            return _handle_list_jobs(k8s_client, args.namespace or config.get('namespace'))
+            return _handle_list_jobs(k8s_client, config, args.namespace or config.get('namespace'))
         
         if args.cleanup_old:
-            return _handle_cleanup_old(k8s_client, args.namespace or config.get('namespace'), args.cleanup_old)
+            return _handle_cleanup_old(k8s_client, config, args.namespace or config.get('namespace'), args.cleanup_old)
         
         # Validate target
         if not args.target:
@@ -214,11 +214,11 @@ def main() -> int:
         return 1
 
 
-def _handle_list_jobs(k8s_client: KubernetesClient, namespace: str) -> int:
+def _handle_list_jobs(k8s_client: KubernetesClient, config: Config, namespace: str) -> int:
     """Handle --list-jobs operation"""
     try:
         from .executor import KubeExecutor
-        executor = KubeExecutor(Config(), k8s_client)
+        executor = KubeExecutor(config, k8s_client)
         jobs = executor.list_jobs(namespace)
         
         if not jobs:
@@ -238,11 +238,11 @@ def _handle_list_jobs(k8s_client: KubernetesClient, namespace: str) -> int:
         return 1
 
 
-def _handle_cleanup_old(k8s_client: KubernetesClient, namespace: str, max_age_hours: int) -> int:
+def _handle_cleanup_old(k8s_client: KubernetesClient, config: Config, namespace: str, max_age_hours: int) -> int:
     """Handle --cleanup-old operation"""
     try:
         from .executor import KubeExecutor
-        executor = KubeExecutor(Config(), k8s_client)
+        executor = KubeExecutor(config, k8s_client)
         cleaned_count = executor.cleanup_old_jobs(namespace, max_age_hours)
         
         print(f"Cleaned up {cleaned_count} jobs older than {max_age_hours} hours")
