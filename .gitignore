@@ -52,3 +52,4 @@ UPLOAD.md
 files.txt
 test.txt
 spades-out/
+!pytest.ini
