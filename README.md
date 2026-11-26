@@ -51,3 +51,17 @@ kubexec "ls -la > output.txt"
 kubexec -d community.wave.seqera.io/library/spades:4.1.0--77799c52e1d1054a \
     "spades.py -1 tests/reads/s_6_1.fastq.gz -2 tests/reads/s_6_2.fastq.gz -o spades-out"
 ```
+
+## Testing
+
+```bash
+pip install -e '.[test]'
+
+pytest                      # unit tests; CLIMB tests run too when CLIMB is detected
+pytest tests/unit           # unit tests only (no cluster needed, runs anywhere)
+pytest -m "not e2e"         # on CLIMB, skip tests that create real jobs
+KUBEXEC_TEST_CLIMB=0 pytest # force-skip the CLIMB suite (=1 forces it on)
+```
+
+CLIMB is detected by the in-cluster service account plus `/shared/team` and `/shared/public`
+being mounted. Tests marked `xfail` document known bugs and will fail loudly (strict) once fixed.
