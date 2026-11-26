@@ -1,5 +1,9 @@
 # kubexec
 
+[![PyPI Python Version](https://img.shields.io/pypi/pyversions/kubexec)](https://pypi.org/project/kubexec/)
+[![PyPI Wheel](https://img.shields.io/pypi/wheel/kubexec)](https://pypi.org/project/kubexec/)
+[![GitHub Release](https://img.shields.io/github/v/release/telatin/kubexec)](https://github.com/telatin/kubexec/releases)
+[![Tests](https://github.com/telatin/kubexec/actions/workflows/tests.yml/badge.svg)](https://github.com/telatin/kubexec/actions/workflows/tests.yml)
 
 ![Kubekec logo](https://raw.githubusercontent.com/telatin/kubexec/55eb22279b7c066987f992db94cb2c49840ba7f3/kubexec-logo.png)
 
