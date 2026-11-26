@@ -43,11 +43,10 @@ setup(
         "Issues": "https://github.com/telatin/kubexec/issues",
         "Documentation": "https://github.com/telatin/kubexec#readme",
     },
-    packages=find_packages(),
+    packages=find_packages(include=["kubexec", "kubexec.*"]),
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
-        "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.10",
