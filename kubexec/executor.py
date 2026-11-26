@@ -1,12 +1,15 @@
 """Command and script execution logic for kubexec"""
 
 import os
+import shlex
+import uuid
 import logging
 from typing import List, Optional, Dict, Any, Tuple
+from kubernetes.client.rest import ApiException
 from .k8s_client import KubernetesClient
 from .config import Config
 from .utils import make_unique_name, is_script_file, parse_volume_mount, validate_resource_spec
-from .exceptions import KubeExecError, JobExecutionError
+from .exceptions import KubeExecError, JobExecutionError, KubernetesClientError
 
 
 logger = logging.getLogger(__name__)
@@ -65,9 +68,7 @@ class KubeExecutor:
         # Note: For existing pods, we can't mount volumes, so we work in the current directory
         if is_script_file(target):
             # For script files, we need to copy the script to the pod first
-            script_content = self._read_script_file(target)
-            script_name = os.path.basename(target)
-            command = ["/bin/bash", "-c", f"cat << 'EOF' > /tmp/{script_name}\n{script_content}\nEOF\nchmod +x /tmp/{script_name} && /tmp/{script_name}"]
+            command = ["/bin/bash", "-c", self._script_shell_command(target)]
         else:
             # Direct command execution in existing pod
             command = ["/bin/bash", "-c", target]
@@ -159,7 +160,6 @@ class KubeExecutor:
         volume_mount_specs.extend(create_shared_volume_mounts())
         
         # Determine kubexec entry path within shared volumes
-        import os
         current_dir = os.getcwd()
         
         # Map current directory to container path using shared volumes
@@ -192,21 +192,33 @@ class KubeExecutor:
                 })
         
         # Prepare command
+        cd_prefix = f"cd {shlex.quote(kubexec_entry_path)} && "
         if is_script_file(target):
-            script_content = self._read_script_file(target)
-            script_name = os.path.basename(target)
-            
             # Embed script content directly in command instead of using ConfigMap
             # This avoids permission issues with ConfigMap creation
-            command = [
-                "/bin/bash", "-c",
-                f"cd {kubexec_entry_path} && cat << 'KUBEXEC_SCRIPT_EOF' > /tmp/{script_name}\n{script_content}\nKUBEXEC_SCRIPT_EOF\nchmod +x /tmp/{script_name} && /tmp/{script_name}"
-            ]
+            command = ["/bin/bash", "-c", self._script_shell_command(target, prefix=cd_prefix)]
         else:
             # Direct command execution - change to entry directory first
-            command = ["/bin/bash", "-c", f"cd {kubexec_entry_path} && {target}"]
+            command = ["/bin/bash", "-c", f"{cd_prefix}{target}"]
         
         return command, volumes, volume_mount_specs
+    
+    def _script_shell_command(self, script_path: str, prefix: str = "") -> str:
+        """Shell snippet that writes a local script into /tmp of the pod and runs it"""
+        content = self._read_script_file(script_path)
+        remote_path = shlex.quote(f"/tmp/{os.path.basename(script_path)}")
+        
+        # Pick a heredoc delimiter that cannot occur in the script
+        delimiter = f"KUBEXEC_EOF_{uuid.uuid4().hex[:8]}"
+        while delimiter in content:
+            delimiter = f"KUBEXEC_EOF_{uuid.uuid4().hex[:8]}"
+        
+        if not content.endswith("\n"):
+            content += "\n"
+        return (
+            f"{prefix}cat << '{delimiter}' > {remote_path}\n{content}{delimiter}\n"
+            f"chmod +x {remote_path} && {remote_path}"
+        )
     
     def _read_script_file(self, file_path: str) -> str:
         """Read script file content"""
@@ -219,7 +231,7 @@ class KubeExecutor:
     def list_jobs(self, namespace: str = "default") -> List[Dict[str, Any]]:
         """List kubexec jobs in namespace"""
         try:
-            jobs = self.batch_v1.list_namespaced_job(
+            jobs = self.k8s_client.batch_v1.list_namespaced_job(
                 namespace=namespace,
                 label_selector="app=kubexec"
             )
@@ -245,7 +257,7 @@ class KubeExecutor:
             import datetime
             cutoff_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=max_age_hours)
             
-            jobs = self.batch_v1.list_namespaced_job(
+            jobs = self.k8s_client.batch_v1.list_namespaced_job(
                 namespace=namespace,
                 label_selector="app=kubexec"
             )

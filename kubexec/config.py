@@ -26,6 +26,7 @@ class Config:
         'workdir': '/tmp',
         'cleanup': True,
         'verbose': False,
+        'verify_ssl': True,  # Set to false to skip Kubernetes API TLS verification
         'timeout': 3600,  # 1 hour default timeout
         'ttl_seconds_after_finished': 60,  # Based on Nextflow config
         'security_context': {
@@ -80,6 +81,11 @@ class Config:
         # Override with environment variables
         self._apply_env_overrides(merged_config)
         
+        if os.getenv('KUBEXEC_TIMEOUT') is None:
+            merged_config['timeout'] = self._parse_timeout(
+                merged_config['timeout'], f"'timeout' in {self.config_file}"
+            )
+        
         return merged_config
     
     def _create_default_config(self) -> None:
@@ -104,18 +110,32 @@ class Config:
             'KUBEXEC_WORKDIR': 'workdir',
             'KUBEXEC_CLEANUP': 'cleanup',
             'KUBEXEC_VERBOSE': 'verbose',
+            'KUBEXEC_VERIFY_SSL': 'verify_ssl',
             'KUBEXEC_TIMEOUT': 'timeout',
         }
         
         for env_var, config_key in env_mappings.items():
             env_value = os.getenv(env_var)
             if env_value is not None:
-                if config_key in ['cleanup', 'verbose']:
+                if config_key in ['cleanup', 'verbose', 'verify_ssl']:
                     config[config_key] = env_value.lower() in ('true', '1', 'yes', 'on')
                 elif config_key == 'timeout':
-                    config[config_key] = int(env_value)
+                    config[config_key] = self._parse_timeout(env_value, env_var)
                 else:
                     config[config_key] = env_value
+    
+    @staticmethod
+    def _parse_timeout(value: Any, source: str) -> int:
+        """Validate a timeout value (seconds): must be a positive integer"""
+        try:
+            if isinstance(value, bool):
+                raise ValueError
+            timeout = int(str(value).strip())
+        except ValueError:
+            raise ConfigurationError(f"Invalid {source} {value!r}: expected a positive integer (seconds)")
+        if timeout <= 0:
+            raise ConfigurationError(f"Invalid {source} {value!r}: expected a positive integer (seconds)")
+        return timeout
     
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value"""

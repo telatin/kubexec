@@ -39,6 +39,7 @@ Examples:
     
     parser.add_argument(
         'target',
+        nargs='?',
         metavar='TARGET',
         help='Command string or path to script file to execute'
     )
@@ -156,7 +157,7 @@ def main() -> int:
         config = Config(args.config)
         
         # Initialize Kubernetes client
-        k8s_client = KubernetesClient(args.context)
+        k8s_client = KubernetesClient(args.context, verify_ssl=config.get('verify_ssl', True))
         
         # Handle special operations
         if args.list_jobs:

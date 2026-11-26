@@ -2,6 +2,7 @@
 
 import os
 import random
+import re
 import string
 import time
 from typing import Tuple
@@ -47,21 +48,24 @@ def parse_volume_mount(volume_spec: str) -> Tuple[str, str, bool]:
     return host_path, pod_path, readonly
 
 
+_MEMORY_RE = re.compile(r'\d+(\.\d+)?(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)')
+_CPU_RE = re.compile(r'(\d+(\.\d+)?|\d+m)')
+
+
 def validate_resource_spec(resource: str, resource_type: str) -> str:
-    """Validate resource specification (memory/CPU)"""
+    """Validate resource specification (memory/CPU)
+
+    Memory uses Kubernetes quantity suffixes (Mi, Gi, M, G, ...); a bare number
+    is taken as MiB. Note that 'm' (milli) is only valid for CPU.
+    """
+    resource = str(resource).strip()
     if resource_type == "memory":
-        if not any(resource.endswith(unit) for unit in ['Mi', 'Gi', 'Ti', 'm', 'k', 'M', 'G', 'T']):
-            # Add default unit if none specified
-            if resource.isdigit():
-                return f"{resource}Mi"
-            raise ValueError(f"Invalid memory spec: {resource}")
+        if resource.isdigit():
+            return f"{resource}Mi"
+        if not _MEMORY_RE.fullmatch(resource):
+            raise ValueError(f"Invalid memory spec: {resource!r}. Use a number with a unit such as 512Mi or 2Gi")
     elif resource_type == "cpu":
-        try:
-            float(resource)
-            return resource
-        except ValueError:
-            if resource.endswith('m'):
-                return resource
-            raise ValueError(f"Invalid CPU spec: {resource}")
+        if not _CPU_RE.fullmatch(resource):
+            raise ValueError(f"Invalid CPU spec: {resource!r}. Use cores (e.g. 2, 0.5) or millicores (e.g. 500m)")
     
     return resource

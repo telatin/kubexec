@@ -1,7 +1,9 @@
 """Kubernetes client operations for kubexec"""
 
+import ssl
 import time
 import logging
+import urllib3
 from typing import List, Tuple, Optional, Dict, Any
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -15,13 +17,13 @@ logger = logging.getLogger(__name__)
 class KubernetesClient:
     """Kubernetes client wrapper for kubexec operations"""
     
-    def __init__(self, context: Optional[str] = None):
-        """Initialize Kubernetes client"""
+    def __init__(self, context: Optional[str] = None, verify_ssl: bool = True):
+        """Initialize Kubernetes client
+
+        TLS certificates are verified by default. Set verify_ssl=False (config
+        key `verify_ssl` / env KUBEXEC_VERIFY_SSL) to explicitly opt out.
+        """
         try:
-            # Disable SSL verification warnings for self-signed certificates
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            
             if context:
                 config.load_kube_config(context=context)
             else:
@@ -36,17 +38,45 @@ class KubernetesClient:
                         logger.warning("No kubeconfig found, using service account authentication")
                         config.load_incluster_config()
             
-            # Configure client for potential SSL issues
             configuration = client.Configuration.get_default_copy()
-            if hasattr(configuration, 'verify_ssl'):
+            if verify_ssl:
+                configuration.verify_ssl = True
+            else:
+                logger.warning("TLS certificate verification is disabled")
                 configuration.verify_ssl = False
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             
-            self.batch_v1 = client.BatchV1Api(client.ApiClient(configuration))
-            self.core_v1 = client.CoreV1Api(client.ApiClient(configuration))
-            self.apps_v1 = client.AppsV1Api(client.ApiClient(configuration))
+            api_client = client.ApiClient(configuration)
+            if verify_ssl:
+                self._relax_strict_ca_check(api_client, configuration)
+            
+            self.batch_v1 = client.BatchV1Api(api_client)
+            self.core_v1 = client.CoreV1Api(api_client)
+            self.apps_v1 = client.AppsV1Api(api_client)
             
         except Exception as e:
             raise KubernetesClientError(f"Failed to initialize Kubernetes client: {e}")
+    
+    @staticmethod
+    def _relax_strict_ca_check(api_client: client.ApiClient, configuration: client.Configuration) -> None:
+        """Keep certificate verification on, but drop Python's VERIFY_X509_STRICT.
+
+        Python 3.13+ enables VERIFY_X509_STRICT by default, which rejects CA
+        certificates lacking the keyUsage extension, as is the case for the
+        CLIMB cluster CA. The chain and hostname are still fully verified.
+        """
+        pool_kw = getattr(api_client.rest_client.pool_manager, 'connection_pool_kw', None)
+        if pool_kw is None or not hasattr(ssl, 'VERIFY_X509_STRICT'):
+            return
+        
+        if configuration.ssl_ca_cert or configuration.ca_cert_data:
+            # urllib3 loads the configured CA into this context; trust only that CA
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        else:
+            ctx = ssl.create_default_context()
+        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+        pool_kw['ssl_context'] = ctx
+        api_client.rest_client.pool_manager.clear()
     
     def get_pods(self, namespace: str = "default") -> List[str]:
         """Get list of pod names in namespace"""

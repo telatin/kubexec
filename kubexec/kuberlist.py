@@ -266,7 +266,7 @@ def main() -> int:
         namespace = args.namespace or config.get('namespace')
         
         # Initialize Kubernetes client
-        k8s_client = KubernetesClient(args.context)
+        k8s_client = KubernetesClient(args.context, verify_ssl=config.get('verify_ssl', True))
         
         if args.watch:
             watch_pods(k8s_client, namespace, args.kubexec)
