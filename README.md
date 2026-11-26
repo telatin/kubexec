@@ -1,7 +1,7 @@
 # kubexec
 
 
-![Kubekec logo](kubexec-logo.png)
+![Kubekec logo](https://raw.githubusercontent.com/telatin/kubexec/55eb22279b7c066987f992db94cb2c49840ba7f3/kubexec-logo.png)
 
 Execute commands and scripts on Kubernetes pods with Docker access.
 
