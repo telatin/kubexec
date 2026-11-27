@@ -1,5 +1,6 @@
 """Utility functions for kubexec"""
 
+import getpass
 import os
 import random
 import re
@@ -13,6 +14,27 @@ def make_unique_name(base_name: str = "kubexec") -> str:
     timestamp = int(time.time())
     random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
     return f"{base_name}-{timestamp}-{random_suffix}"
+
+
+def get_user_identity() -> str:
+    """Name identifying the current user, usable as a Kubernetes label value
+
+    On CLIMB every user is uid 1000 ("jovyan") and $USER is unset, so the
+    JupyterHub login name is the only reliable identity.
+    """
+    name = os.getenv("JUPYTERHUB_USER") or os.getenv("USER")
+    if not name:
+        try:
+            name = getpass.getuser()
+        except Exception:
+            name = ""
+    return sanitize_label_value(name)
+
+
+def sanitize_label_value(value: str) -> str:
+    """Make a string valid as a Kubernetes label value (<=63 chars, [A-Za-z0-9_.-], alphanumeric ends)"""
+    cleaned = re.sub(r'[^A-Za-z0-9_.-]', '_', value or "")[:63].strip('_.-')
+    return cleaned or "unknown"
 
 
 def make_unique_filename(filename: str, ext: str = "") -> str:

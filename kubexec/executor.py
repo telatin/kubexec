@@ -1,25 +1,41 @@
 """Command and script execution logic for kubexec"""
 
 import os
+import posixpath
 import shlex
+import time
 import uuid
 import logging
 from typing import List, Optional, Dict, Any, Tuple
 from kubernetes.client.rest import ApiException
 from .k8s_client import KubernetesClient
 from .config import Config
-from .utils import make_unique_name, is_script_file, parse_volume_mount, validate_resource_spec
+from .templates import OWNER_LABEL
+from .utils import make_unique_name, is_script_file, parse_volume_mount, validate_resource_spec, get_user_identity, sanitize_label_value
 from .exceptions import KubeExecError, JobExecutionError, KubernetesClientError
 
 
 logger = logging.getLogger(__name__)
 
+TEAM_ROOT = '/shared/team'
+PUBLIC_ROOT = '/shared/public'
+
+
+def _is_under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root + '/')
+
+
+def on_shared_volume(path: str) -> bool:
+    """True if path lies on one of the volumes that are mounted in every job"""
+    return _is_under(path, TEAM_ROOT) or _is_under(path, PUBLIC_ROOT)
+
 
 class KubeExecutor:
     """Main executor for kubexec operations"""
     
-    def __init__(self, config: Config, k8s_client: Optional[KubernetesClient] = None):
+    def __init__(self, config: Config, k8s_client: Optional[KubernetesClient] = None, user: Optional[str] = None):
         self.config = config
+        self.user = sanitize_label_value(user) if user else get_user_identity()
         self.k8s_client = k8s_client or KubernetesClient()
     
     def execute(
@@ -44,7 +60,7 @@ class KubeExecutor:
         ns = namespace or self.config.get('namespace')
         mem = validate_resource_spec(memory or self.config.get('memory'), 'memory')
         cpu_limit = validate_resource_spec(cpu or self.config.get('cpu'), 'cpu')
-        work_dir = workdir or self.config.get('workdir')
+        work_dir = self.config.get('workdir')  # container start directory; the command moves to the run directory
         should_cleanup = cleanup if cleanup is not None else self.config.get('cleanup')
         
         # Determine execution strategy
@@ -53,7 +69,7 @@ class KubeExecutor:
         else:
             return self._execute_in_new_job(
                 target, image, ns, mem, cpu_limit, work_dir, 
-                volume_mounts, should_cleanup, dry_run, **kwargs
+                volume_mounts, should_cleanup, dry_run, run_dir=workdir, **kwargs
             )
     
     def _execute_in_existing_pod(
@@ -90,6 +106,7 @@ class KubeExecutor:
         volume_mounts: Optional[List[str]],
         cleanup: bool,
         dry_run: bool,
+        run_dir: Optional[str] = None,
         **kwargs
     ) -> Tuple[int, str]:
         """Execute command in new Kubernetes job"""
@@ -97,7 +114,7 @@ class KubeExecutor:
         job_name = make_unique_name("kubexec-job")
         
         # Prepare command and volumes
-        command, volumes, volume_mount_specs = self._prepare_execution(target, job_name, namespace, volume_mounts)
+        command, volumes, volume_mount_specs = self._prepare_execution(target, job_name, namespace, volume_mounts, run_dir)
         
         if dry_run:
             return 0, f"Would create job {job_name} with image {image}: {' '.join(command)}"
@@ -119,6 +136,7 @@ class KubeExecutor:
                 ttl_seconds_after_finished=self.config.get('ttl_seconds_after_finished', 60),
                 node_selector=self.config.get('node_selector'),
                 automount_service_account_token=self.config.get('automount_service_account_token', False),
+                owner=self.user,
                 **kwargs
             )
             
@@ -147,7 +165,8 @@ class KubeExecutor:
         target: str,
         job_name: str,
         namespace: str,
-        volume_mounts: Optional[List[str]]
+        volume_mounts: Optional[List[str]],
+        run_dir: Optional[str] = None
     ) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Prepare command, volumes, and volume mounts for execution"""
         
@@ -159,19 +178,7 @@ class KubeExecutor:
         volumes.extend(create_shared_volumes())
         volume_mount_specs.extend(create_shared_volume_mounts())
         
-        # Determine kubexec entry path within shared volumes
-        current_dir = os.getcwd()
-        
-        # Map current directory to container path using shared volumes
-        if current_dir.startswith('/shared/team'):
-            # Already in shared team directory
-            kubexec_entry_path = current_dir.replace('/shared/team', '/shared/team')
-        elif current_dir.startswith('/shared/public'):
-            # In shared public directory
-            kubexec_entry_path = current_dir.replace('/shared/public', '/shared/public')
-        else:
-            # Default to shared team directory
-            kubexec_entry_path = '/shared/team'
+        kubexec_entry_path, create_entry_path, remove_if_empty = self._resolve_run_dir(run_dir)
         
         # Add custom volume mounts
         if volume_mounts:
@@ -192,7 +199,7 @@ class KubeExecutor:
                 })
         
         # Prepare command
-        cd_prefix = f"cd {shlex.quote(kubexec_entry_path)} && "
+        cd_prefix = self._cd_prefix(kubexec_entry_path, create_entry_path, remove_if_empty)
         if is_script_file(target):
             # Embed script content directly in command instead of using ConfigMap
             # This avoids permission issues with ConfigMap creation
@@ -202,6 +209,59 @@ class KubeExecutor:
             command = ["/bin/bash", "-c", f"{cd_prefix}{target}"]
         
         return command, volumes, volume_mount_specs
+    
+    @staticmethod
+    def _new_run_id() -> str:
+        """Sortable, collision-proof id of one run: timestamp plus random suffix"""
+        return f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    
+    def _expand(self, path: str, run_id: str) -> str:
+        """Substitute {user} (label-safe login name) and {run} (unique id of this run)"""
+        return path.replace('{user}', self.user).replace('{run}', run_id)
+    
+    def _resolve_run_dir(self, explicit: Optional[str] = None, run_id: Optional[str] = None) -> Tuple[str, bool, bool]:
+        """Decide in which directory of the pod the command runs
+
+        Returns (directory, create_it, remove_if_empty). Order of precedence:
+          1. an explicit directory (-w); relative paths are resolved against the base below
+          2. the current directory, when it is on a volume that jobs can see
+          3. the configured `default_workdir` (default: a unique folder per run under
+             /shared/team/kubexec/work/<user>), used when the current directory is not shared
+        
+        A folder whose name contains {run} belongs to this run alone, so it is
+        removed again if the command left it empty.
+        """
+        run_id = run_id or self._new_run_id()
+        cwd = os.getcwd()
+        default_template = self.config.get('default_workdir')
+        default_dir = posixpath.normpath(self._expand(default_template, run_id))
+        base = cwd if on_shared_volume(cwd) else default_dir
+        
+        if explicit:
+            path = self._expand(explicit, run_id)
+            path = posixpath.normpath(path if posixpath.isabs(path) else posixpath.join(base, path))
+            unique = '{run}' in explicit or (not posixpath.isabs(explicit) and base == default_dir and '{run}' in default_template)
+        else:
+            path = base
+            unique = base == default_dir and '{run}' in default_template
+            if path != cwd:
+                logger.info(f"Current directory is not on a shared volume; running in {path}")
+        
+        # Only create folders on the writable team volume, and never the user's own cwd
+        create = path != cwd and _is_under(path, TEAM_ROOT)
+        return path, create, create and unique
+    
+    @staticmethod
+    def _cd_prefix(path: str, create: bool, remove_if_empty: bool) -> str:
+        """Shell prefix that moves into the run directory (creating it if requested)"""
+        quoted = shlex.quote(path)
+        if not create:
+            return f"cd {quoted} && "
+        prefix = f"mkdir -p {quoted} && cd {quoted} && "
+        if remove_if_empty:
+            # rmdir only removes an empty folder; the exit status of the command is preserved
+            prefix += f"trap {shlex.quote(f'cd /; rmdir {quoted} 2>/dev/null')} EXIT && "
+        return prefix
     
     def _script_shell_command(self, script_path: str, prefix: str = "") -> str:
         """Shell snippet that writes a local script into /tmp of the pod and runs it"""
@@ -228,12 +288,19 @@ class KubeExecutor:
         except IOError as e:
             raise KubeExecError(f"Failed to read script file {file_path}: {e}")
     
-    def list_jobs(self, namespace: str = "default") -> List[Dict[str, Any]]:
-        """List kubexec jobs in namespace"""
+    def _job_selector(self, all_users: bool) -> str:
+        """Label selector for kubexec jobs: the current user's, or everyone's"""
+        selector = "app=kubexec"
+        if not all_users:
+            selector += f",{OWNER_LABEL}={self.user}"
+        return selector
+    
+    def list_jobs(self, namespace: str = "default", all_users: bool = False) -> List[Dict[str, Any]]:
+        """List kubexec jobs in namespace (the current user's unless all_users)"""
         try:
             jobs = self.k8s_client.batch_v1.list_namespaced_job(
                 namespace=namespace,
-                label_selector="app=kubexec"
+                label_selector=self._job_selector(all_users)
             )
             
             job_list = []
@@ -241,6 +308,7 @@ class KubeExecutor:
                 job_info = {
                     'name': job.metadata.name,
                     'status': 'completed' if job.status.succeeded else 'failed' if job.status.failed else 'running',
+                    'user': (job.metadata.labels or {}).get(OWNER_LABEL, 'unknown'),
                     'created': job.metadata.creation_timestamp,
                     'image': job.spec.template.spec.containers[0].image if job.spec.template.spec.containers else 'unknown'
                 }
@@ -251,15 +319,15 @@ class KubeExecutor:
         except ApiException as e:
             raise KubernetesClientError(f"Failed to list jobs: {e}")
     
-    def cleanup_old_jobs(self, namespace: str = "default", max_age_hours: int = 24) -> int:
-        """Cleanup old kubexec jobs"""
+    def cleanup_old_jobs(self, namespace: str = "default", max_age_hours: int = 24, all_users: bool = False) -> int:
+        """Cleanup old kubexec jobs (the current user's unless all_users)"""
         try:
             import datetime
             cutoff_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=max_age_hours)
             
             jobs = self.k8s_client.batch_v1.list_namespaced_job(
                 namespace=namespace,
-                label_selector="app=kubexec"
+                label_selector=self._job_selector(all_users)
             )
             
             cleaned_count = 0

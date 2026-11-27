@@ -1,5 +1,6 @@
 """Configuration management for kubexec"""
 
+import logging
 import os
 import yaml
 from pathlib import Path
@@ -7,13 +8,16 @@ from typing import Dict, Any, Optional
 from .exceptions import ConfigurationError
 
 
+logger = logging.getLogger(__name__)
+
+
 class Config:
     """Configuration manager for kubexec"""
     
+    # Personal configuration lives in the user's home. Nothing is ever created in
+    # shared locations such as /shared/team, where all users would share one file.
     DEFAULT_CONFIG_DIRS = [
-        f"/shared/team/kubexec/{os.getenv('USER', 'default')}/",
         os.path.join(os.path.expanduser("~"), ".config", "kubexec"),
-        f"/tmp/kubexec"
     ]
     
     DEFAULT_CONFIG_FILE = "config.yaml"
@@ -23,7 +27,12 @@ class Config:
         'namespace': None,  # Will be auto-detected from service account
         'memory': '1Gi',
         'cpu': '1',
-        'workdir': '/tmp',
+        'workdir': '/tmp',  # container start directory (commands run in the directory chosen by kubexec)
+        # Where jobs run when the current directory is not on a shared volume. Created on
+        # demand inside the job. {user} is your login name; {run} is a unique id per run
+        # (timestamp + random), so parallel or repeated runs never overwrite each other.
+        # Drop {run} to share one persistent folder between runs.
+        'default_workdir': '/shared/team/kubexec/work/{user}/{run}',
         'cleanup': True,
         'verbose': False,
         'verify_ssl': True,  # Set to false to skip Kubernetes API TLS verification
@@ -63,8 +72,11 @@ class Config:
             self._create_default_config()
         
         try:
-            with open(self.config_file, 'r') as f:
-                config = yaml.safe_load(f) or {}
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    config = yaml.safe_load(f) or {}
+            else:
+                config = {}
         except yaml.YAMLError as e:
             raise ConfigurationError(f"Invalid YAML in config file {self.config_file}: {e}")
         except IOError as e:
@@ -81,6 +93,12 @@ class Config:
         # Override with environment variables
         self._apply_env_overrides(merged_config)
         
+        default_workdir = merged_config.get('default_workdir')
+        if not isinstance(default_workdir, str) or not default_workdir.startswith('/'):
+            raise ConfigurationError(
+                f"Invalid 'default_workdir' {default_workdir!r}: expected an absolute path (may contain {{user}})"
+            )
+        
         if os.getenv('KUBEXEC_TIMEOUT') is None:
             merged_config['timeout'] = self._parse_timeout(
                 merged_config['timeout'], f"'timeout' in {self.config_file}"
@@ -89,16 +107,17 @@ class Config:
         return merged_config
     
     def _create_default_config(self) -> None:
-        """Create default configuration file"""
-        config_dir = os.path.dirname(self.config_file)
-        os.makedirs(config_dir, exist_ok=True)
-        
+        """Create default configuration file (best effort: defaults apply without it)"""
         # Use detected namespace in default config
         default_config = self.DEFAULT_CONFIG.copy()
         default_config['namespace'] = self._detected_namespace
         
-        with open(self.config_file, 'w') as f:
-            yaml.dump(default_config, f, default_flow_style=False, indent=2)
+        try:
+            os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
+            with open(self.config_file, 'w') as f:
+                yaml.dump(default_config, f, default_flow_style=False, indent=2)
+        except OSError as e:
+            logger.debug(f"Could not create default config {self.config_file}: {e}; using built-in defaults")
     
     def _apply_env_overrides(self, config: Dict[str, Any]) -> None:
         """Apply environment variable overrides"""
@@ -108,6 +127,7 @@ class Config:
             'KUBEXEC_MEMORY': 'memory',
             'KUBEXEC_CPU': 'cpu',
             'KUBEXEC_WORKDIR': 'workdir',
+            'KUBEXEC_DEFAULT_WORKDIR': 'default_workdir',
             'KUBEXEC_CLEANUP': 'cleanup',
             'KUBEXEC_VERBOSE': 'verbose',
             'KUBEXEC_VERIFY_SSL': 'verify_ssl',

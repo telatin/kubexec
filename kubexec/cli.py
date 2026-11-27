@@ -71,7 +71,11 @@ Examples:
     
     parser.add_argument(
         '-w', '--workdir',
-        help='Working directory inside pod (default: /tmp)'
+        help=('Directory to run in inside the job. Default: the current directory if it is under '
+              '/shared/team or /shared/public, otherwise a new folder per run '
+              '(config key default_workdir, /shared/team/kubexec/work/{user}/{run}). '
+              'Relative paths are resolved against that default. {user} is your login name '
+              'and {run} a unique id per run, usable in paths')
     )
     
     parser.add_argument(
@@ -124,14 +128,20 @@ Examples:
     parser.add_argument(
         '--list-jobs',
         action='store_true',
-        help='List recent kubexec jobs'
+        help='List your recent kubexec jobs'
     )
     
     parser.add_argument(
         '--cleanup-old',
         type=int,
         metavar='HOURS',
-        help='Cleanup jobs older than specified hours'
+        help='Cleanup your jobs older than specified hours'
+    )
+    
+    parser.add_argument(
+        '--all-users',
+        action='store_true',
+        help='With --list-jobs / --cleanup-old, act on every user\'s jobs in the namespace, not only yours'
     )
     
     parser.add_argument(
@@ -161,10 +171,10 @@ def main() -> int:
         
         # Handle special operations
         if args.list_jobs:
-            return _handle_list_jobs(k8s_client, config, args.namespace or config.get('namespace'))
+            return _handle_list_jobs(k8s_client, config, args.namespace or config.get('namespace'), args.all_users)
         
         if args.cleanup_old:
-            return _handle_cleanup_old(k8s_client, config, args.namespace or config.get('namespace'), args.cleanup_old)
+            return _handle_cleanup_old(k8s_client, config, args.namespace or config.get('namespace'), args.cleanup_old, args.all_users)
         
         # Validate target
         if not args.target:
@@ -214,22 +224,24 @@ def main() -> int:
         return 1
 
 
-def _handle_list_jobs(k8s_client: KubernetesClient, config: Config, namespace: str) -> int:
+def _handle_list_jobs(k8s_client: KubernetesClient, config: Config, namespace: str, all_users: bool = False) -> int:
     """Handle --list-jobs operation"""
     try:
         from .executor import KubeExecutor
         executor = KubeExecutor(config, k8s_client)
-        jobs = executor.list_jobs(namespace)
+        jobs = executor.list_jobs(namespace, all_users)
         
         if not jobs:
-            print("No kubexec jobs found")
+            print("No kubexec jobs found" if all_users else "No kubexec jobs of yours found (use --all-users to see everyone's)")
             return 0
         
-        print(f"{'NAME':<30} {'STATUS':<12} {'IMAGE':<30} {'CREATED'}")
-        print("-" * 90)
+        user_header = f"{'USER':<20} " if all_users else ""
+        print(f"{'NAME':<30} {user_header}{'STATUS':<12} {'IMAGE':<30} {'CREATED'}")
+        print("-" * (90 + len(user_header)))
         for job in jobs:
             created = job['created'].strftime('%Y-%m-%d %H:%M:%S') if job['created'] else 'unknown'
-            print(f"{job['name']:<30} {job['status']:<12} {job['image']:<30} {created}")
+            user_col = f"{job['user']:<20} " if all_users else ""
+            print(f"{job['name']:<30} {user_col}{job['status']:<12} {job['image']:<30} {created}")
         
         return 0
         
@@ -238,14 +250,14 @@ def _handle_list_jobs(k8s_client: KubernetesClient, config: Config, namespace: s
         return 1
 
 
-def _handle_cleanup_old(k8s_client: KubernetesClient, config: Config, namespace: str, max_age_hours: int) -> int:
+def _handle_cleanup_old(k8s_client: KubernetesClient, config: Config, namespace: str, max_age_hours: int, all_users: bool = False) -> int:
     """Handle --cleanup-old operation"""
     try:
         from .executor import KubeExecutor
         executor = KubeExecutor(config, k8s_client)
-        cleaned_count = executor.cleanup_old_jobs(namespace, max_age_hours)
+        cleaned_count = executor.cleanup_old_jobs(namespace, max_age_hours, all_users)
         
-        print(f"Cleaned up {cleaned_count} jobs older than {max_age_hours} hours")
+        print(f"Cleaned up {cleaned_count} jobs older than {max_age_hours} hours" + ("" if all_users else " (yours only; use --all-users for everyone's)"))
         return 0
         
     except Exception as e:

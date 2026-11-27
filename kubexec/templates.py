@@ -3,6 +3,9 @@
 from typing import Dict, List, Any, Optional
 
 
+OWNER_LABEL = 'kubexec-user'
+
+
 def create_job_template(
     name: str,
     image: str,
@@ -19,7 +22,8 @@ def create_job_template(
     backoff_limit: int = 0,
     ttl_seconds_after_finished: int = 60,
     node_selector: Optional[Dict[str, str]] = None,
-    automount_service_account_token: bool = False
+    automount_service_account_token: bool = False,
+    owner: Optional[str] = None
 ) -> Dict[str, Any]:
     """Create a Kubernetes Job template"""
     
@@ -67,26 +71,32 @@ def create_job_template(
     if volumes:
         pod_spec['volumes'] = volumes
     
+    job_labels = {
+        'app': 'kubexec',
+        'created-by': 'kubexec'
+    }
+    pod_labels = {
+        'app': 'kubexec',
+        'job': name
+    }
+    if owner:
+        job_labels[OWNER_LABEL] = owner
+        pod_labels[OWNER_LABEL] = owner
+    
     job_template = {
         'apiVersion': 'batch/v1',
         'kind': 'Job',
         'metadata': {
             'name': name,
             'namespace': namespace,
-            'labels': {
-                'app': 'kubexec',
-                'created-by': 'kubexec'
-            }
+            'labels': job_labels
         },
         'spec': {
             'backoffLimit': backoff_limit,
             'ttlSecondsAfterFinished': ttl_seconds_after_finished,
             'template': {
                 'metadata': {
-                    'labels': {
-                        'app': 'kubexec',
-                        'job': name
-                    }
+                    'labels': pod_labels
                 },
                 'spec': pod_spec
             }
