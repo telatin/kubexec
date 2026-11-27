@@ -4,13 +4,13 @@ from kubexec.config import Config
 
 
 @pytest.fixture(autouse=True)
-def default_config_location_is_unusable(tmp_path, monkeypatch):
+def default_config_location_is_off_limits(monkeypatch):
     """Unit tests must always pass an explicit config file.
 
-    Falling back to the default location (/shared/team/kubexec/..., ~/.config/...)
-    would work on a developer machine or CLIMB but fail on CI, so make any such
-    fallback fail everywhere.
+    Resolving the default location (~/.config/kubexec) would read or create files
+    in the developer's home and behave differently on CI, so fail loudly instead.
     """
-    blocker = tmp_path / "not-a-directory"
-    blocker.write_text("")
-    monkeypatch.setattr(Config, "DEFAULT_CONFIG_DIRS", [str(blocker / "kubexec")])
+    def refuse(self):
+        raise AssertionError("unit tests must pass an explicit config file path")
+
+    monkeypatch.setattr(Config, "_find_config_file", refuse)

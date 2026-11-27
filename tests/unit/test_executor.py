@@ -1,4 +1,5 @@
 import datetime
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -23,7 +24,7 @@ def k8s():
 
 @pytest.fixture
 def executor(config, k8s):
-    return KubeExecutor(config, k8s)
+    return KubeExecutor(config, k8s, user="alice")
 
 
 def fake_cwd(monkeypatch, path):
@@ -35,9 +36,9 @@ class TestPrepareExecution:
     @pytest.mark.parametrize("cwd, expected", [
         ("/shared/team/proj/x", "/shared/team/proj/x"),
         ("/shared/public/data", "/shared/public/data"),
-        ("/home/someone", "/shared/team"),
+        ("/shared/team", "/shared/team"),
     ])
-    def test_command_runs_in_mapped_directory(self, executor, monkeypatch, cwd, expected):
+    def test_command_runs_in_current_directory_when_shared(self, executor, monkeypatch, cwd, expected):
         with monkeypatch.context() as m:
             fake_cwd(m, cwd)
             command, _, _ = executor._prepare_execution("echo hi", "job", "ns", None)
@@ -62,6 +63,136 @@ class TestPrepareExecution:
         assert "chmod +x /tmp/job.sh && /tmp/job.sh" in command[2]
 
 
+def run_dir(executor, monkeypatch, cwd, explicit=None, run_id="RUN1"):
+    with monkeypatch.context() as m:
+        fake_cwd(m, cwd)
+        return executor._resolve_run_dir(explicit, run_id)
+
+
+class TestRunDirectory:
+    PER_RUN = "/shared/team/kubexec/work/alice/RUN1"
+
+    @pytest.fixture(autouse=True)
+    def fixed_run_id(self, executor):
+        executor._new_run_id = lambda: "RUN1"
+
+    @pytest.mark.parametrize("cwd", ["/home/someone", "/tmp", "/shared/teamX/proj", "/shared"])
+    def test_unshared_cwd_uses_a_new_per_run_folder(self, executor, monkeypatch, cwd):
+        assert run_dir(executor, monkeypatch, cwd) == (self.PER_RUN, True, True)
+
+    def test_fallback_command_creates_the_folder_and_removes_it_if_left_empty(self, executor, monkeypatch):
+        with monkeypatch.context() as m:
+            fake_cwd(m, "/home/someone")
+            command, _, _ = executor._prepare_execution("echo hi", "job", "ns", None)
+        assert command[2] == (
+            f"mkdir -p {self.PER_RUN} && cd {self.PER_RUN} && "
+            f"trap 'cd /; rmdir {self.PER_RUN} 2>/dev/null' EXIT && echo hi"
+        )
+
+    def test_shared_cwd_is_used_as_is_and_not_created(self, executor, monkeypatch):
+        assert run_dir(executor, monkeypatch, "/shared/team/proj") == ("/shared/team/proj", False, False)
+
+    def test_run_ids_are_unique_and_sortable(self):
+        ids = {KubeExecutor._new_run_id() for _ in range(200)}
+        assert len(ids) == 200
+        assert all(re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{8}", i) for i in ids)
+
+    def test_each_job_gets_its_own_folder(self, config, k8s, monkeypatch):
+        executor = KubeExecutor(config, k8s, user="alice")
+        with monkeypatch.context() as m:
+            fake_cwd(m, "/home/x")
+            commands = [executor._prepare_execution("echo hi", "job", "ns", None)[0][2] for _ in range(5)]
+        folders = {re.search(r"mkdir -p (\S+)", c).group(1) for c in commands}
+        assert len(folders) == 5 and all(f.startswith("/shared/team/kubexec/work/alice/") for f in folders)
+
+    def test_configured_default_without_run_placeholder_is_one_shared_folder(self, make_config, k8s, monkeypatch):
+        config = make_config("default_workdir: /shared/team/data/{user}/runs\n")
+        executor = KubeExecutor(config, k8s, user="alice")
+        assert run_dir(executor, monkeypatch, "/home/x") == ("/shared/team/data/alice/runs", True, False)
+
+    def test_user_name_cannot_escape_the_folder(self, config, k8s, monkeypatch):
+        executor = KubeExecutor(config, k8s, user="../../etc")
+        path, _, _ = run_dir(executor, monkeypatch, "/home/x")
+        assert path.startswith("/shared/team/kubexec/work/") and ".." not in path
+
+    def test_explicit_absolute_directory_is_kept_not_cleaned(self, executor, monkeypatch):
+        assert run_dir(executor, monkeypatch, "/home/x", "/shared/team/out") == ("/shared/team/out", True, False)
+        assert run_dir(executor, monkeypatch, "/shared/team/proj", "/shared/team/out") == ("/shared/team/out", True, False)
+
+    def test_explicit_directory_with_run_placeholder_is_unique_per_run(self, executor, monkeypatch):
+        assert run_dir(executor, monkeypatch, "/shared/team/p", "results/{user}/{run}") == (
+            "/shared/team/p/results/alice/RUN1", True, True)
+
+    def test_explicit_directory_equal_to_cwd_is_not_created(self, executor, monkeypatch):
+        assert run_dir(executor, monkeypatch, "/shared/team/proj", "/shared/team/proj") == ("/shared/team/proj", False, False)
+
+    def test_explicit_relative_directory(self, executor, monkeypatch):
+        assert run_dir(executor, monkeypatch, "/shared/team/proj", "results/run1") == (
+            "/shared/team/proj/results/run1", True, False)
+        # from an unshared cwd it is resolved inside this run's folder
+        assert run_dir(executor, monkeypatch, "/home/x", "results") == (f"{self.PER_RUN}/results", True, True)
+
+    def test_explicit_directory_outside_the_team_volume_is_not_created(self, executor, monkeypatch):
+        assert run_dir(executor, monkeypatch, "/home/x", "/opt/tool") == ("/opt/tool", False, False)
+        assert run_dir(executor, monkeypatch, "/home/x", "/shared/public/data") == ("/shared/public/data", False, False)
+
+    def test_fallback_is_announced_but_a_shared_cwd_is_silent(self, executor, monkeypatch, caplog):
+        with caplog.at_level("INFO", logger="kubexec.executor"):
+            run_dir(executor, monkeypatch, "/shared/team/proj")
+            assert "not on a shared volume" not in caplog.text
+            run_dir(executor, monkeypatch, "/home/x")
+            assert "not on a shared volume" in caplog.text and self.PER_RUN in caplog.text
+
+    def test_workdir_option_is_the_run_directory_not_the_container_start_dir(self, executor, k8s):
+        executor.execute("echo hi", workdir="/shared/team/out")
+        assert k8s.create_job.call_args.kwargs["workdir"] == "/tmp"
+        command = k8s.create_job.call_args.kwargs["command"]
+        assert command[2] == "mkdir -p /shared/team/out && cd /shared/team/out && echo hi"
+
+    def test_dry_run_shows_the_directory(self, executor, monkeypatch):
+        with monkeypatch.context() as m:
+            fake_cwd(m, "/home/x")
+            _, message = executor.execute("echo hi", dry_run=True)
+        assert f"cd {self.PER_RUN}" in message
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+class TestCdPrefixBehaviour:
+    """Run the generated prefix with real bash against a temp directory"""
+
+    @staticmethod
+    def run(prefix, command):
+        return subprocess.run(["/bin/bash", "-c", prefix + command], capture_output=True, text=True)
+
+    def test_unique_folder_is_removed_when_nothing_was_written(self, tmp_path):
+        folder = tmp_path / "work" / "run"
+        result = self.run(KubeExecutor._cd_prefix(str(folder), True, True), "echo hi")
+        assert (result.returncode, result.stdout.strip()) == (0, "hi")
+        assert not folder.exists()
+        assert (tmp_path / "work").exists()
+
+    def test_unique_folder_is_kept_when_output_was_written(self, tmp_path):
+        folder = tmp_path / "work" / "run"
+        self.run(KubeExecutor._cd_prefix(str(folder), True, True), "echo data > out.txt")
+        assert (folder / "out.txt").read_text() == "data\n"
+
+    @pytest.mark.parametrize("command, code", [("exit 3", 3), ("false", 1), ("true", 0)])
+    def test_exit_status_is_preserved(self, tmp_path, command, code):
+        folder = tmp_path / "run"
+        assert self.run(KubeExecutor._cd_prefix(str(folder), True, True), command).returncode == code
+
+    def test_shared_folder_is_not_removed(self, tmp_path):
+        folder = tmp_path / "stable"
+        self.run(KubeExecutor._cd_prefix(str(folder), True, False), "true")
+        assert folder.is_dir()
+
+    def test_awkward_paths_are_quoted(self, tmp_path):
+        folder = tmp_path / "it's a run"
+        result = self.run(KubeExecutor._cd_prefix(str(folder), True, True), "pwd; touch f")
+        assert result.stdout.strip() == str(folder)
+        assert (folder / "f").exists()
+
+
 class TestExecute:
     def test_dry_run_does_not_touch_cluster(self, executor, k8s):
         code, msg = executor.execute("echo hi", dry_run=True)
@@ -77,6 +208,15 @@ class TestExecute:
         assert kwargs["namespace"] == "test-ns"
         assert kwargs["memory"] == "1Gi"
         k8s.cleanup_job.assert_called_once()
+
+    def test_new_jobs_are_labelled_with_their_owner(self, executor, k8s):
+        executor.execute("echo hi")
+        assert k8s.create_job.call_args.kwargs["owner"] == "alice"
+
+    def test_default_owner_is_the_current_user(self, config, k8s, monkeypatch):
+        monkeypatch.setenv("JUPYTERHUB_USER", "telatin.mmb-dtp")
+        KubeExecutor(config, k8s).execute("echo hi")
+        assert k8s.create_job.call_args.kwargs["owner"] == "telatin.mmb-dtp"
 
     def test_overrides_and_no_cleanup(self, executor, k8s):
         executor.execute("echo hi", docker_image="alpine", namespace="other", memory="2Gi", cleanup=False)
@@ -121,11 +261,32 @@ class TestJobManagement:
     def test_list_jobs(self, executor, k8s):
         job = make_job("a", 1)
         job.status.succeeded = 1
+        job.metadata.labels = {"kubexec-user": "alice"}
         k8s.batch_v1.list_namespaced_job.return_value.items = [job]
         jobs = executor.list_jobs("ns")
         assert [j["name"] for j in jobs] == ["a"]
         assert jobs[0]["status"] == "completed"
-        assert k8s.batch_v1.list_namespaced_job.call_args.kwargs["label_selector"] == "app=kubexec"
+        assert jobs[0]["user"] == "alice"
+
+    def test_listing_and_cleanup_are_scoped_to_the_current_user_by_default(self, executor, k8s):
+        k8s.batch_v1.list_namespaced_job.return_value.items = []
+        executor.list_jobs("ns")
+        executor.cleanup_old_jobs("ns", 24)
+        selectors = [c.kwargs["label_selector"] for c in k8s.batch_v1.list_namespaced_job.call_args_list]
+        assert selectors == ["app=kubexec,kubexec-user=alice"] * 2
+
+    def test_all_users_removes_the_user_filter(self, executor, k8s):
+        k8s.batch_v1.list_namespaced_job.return_value.items = []
+        executor.list_jobs("ns", all_users=True)
+        executor.cleanup_old_jobs("ns", 24, all_users=True)
+        selectors = [c.kwargs["label_selector"] for c in k8s.batch_v1.list_namespaced_job.call_args_list]
+        assert selectors == ["app=kubexec"] * 2
+
+    def test_jobs_without_owner_label_are_reported_as_unknown(self, executor, k8s):
+        job = make_job("legacy", 1)
+        job.metadata.labels = None
+        k8s.batch_v1.list_namespaced_job.return_value.items = [job]
+        assert executor.list_jobs("ns", all_users=True)[0]["user"] == "unknown"
 
     def test_cleanup_old_jobs_only_removes_old(self, executor, k8s):
         k8s.batch_v1.list_namespaced_job.return_value.items = [make_job("old", 48), make_job("new", 1)]

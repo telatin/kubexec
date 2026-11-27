@@ -50,3 +50,15 @@ def test_shared_volumes_and_mounts_are_consistent():
     assert set(mounts) == volume_names
     assert mounts["shared-team-volume"]["mountPath"] == "/shared/team"
     assert mounts["shared-public-volume"]["readOnly"] is True
+
+
+def test_owner_label_on_job_and_pod_when_given():
+    job = create_job_template("j", "alpine", ["true"], owner="telatin.mmb-dtp")
+    assert job["metadata"]["labels"]["kubexec-user"] == "telatin.mmb-dtp"
+    assert job["spec"]["template"]["metadata"]["labels"]["kubexec-user"] == "telatin.mmb-dtp"
+    assert job["metadata"]["labels"]["app"] == "kubexec"
+
+
+def test_no_owner_label_without_owner():
+    job = create_job_template("j", "alpine", ["true"])
+    assert "kubexec-user" not in job["metadata"]["labels"]

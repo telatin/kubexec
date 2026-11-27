@@ -3,9 +3,11 @@ import re
 import pytest
 
 from kubexec.utils import (
+    get_user_identity,
     is_script_file,
     make_unique_name,
     parse_volume_mount,
+    sanitize_label_value,
     validate_resource_spec,
 )
 
@@ -64,3 +66,38 @@ def test_validate_cpu(spec):
 def test_validate_cpu_rejects_garbage(spec):
     with pytest.raises(ValueError, match="Invalid CPU spec"):
         validate_resource_spec(spec, "cpu")
+
+
+class TestUserIdentity:
+    def test_jupyterhub_user_wins(self, monkeypatch):
+        monkeypatch.setenv("JUPYTERHUB_USER", "telatin.mmb-dtp")
+        monkeypatch.setenv("USER", "jovyan")
+        assert get_user_identity() == "telatin.mmb-dtp"
+
+    def test_falls_back_to_user_then_getpass(self, monkeypatch):
+        monkeypatch.delenv("JUPYTERHUB_USER", raising=False)
+        monkeypatch.setenv("USER", "alice")
+        assert get_user_identity() == "alice"
+        monkeypatch.delenv("USER")
+        monkeypatch.setattr("kubexec.utils.getpass.getuser", lambda: "bob")
+        assert get_user_identity() == "bob"
+
+    def test_unknown_when_nothing_available(self, monkeypatch):
+        monkeypatch.delenv("JUPYTERHUB_USER", raising=False)
+        monkeypatch.delenv("USER", raising=False)
+
+        def fail():
+            raise KeyError("no user")
+        monkeypatch.setattr("kubexec.utils.getpass.getuser", fail)
+        assert get_user_identity() == "unknown"
+
+    @pytest.mark.parametrize("raw, expected", [
+        ("telatin.mmb-dtp", "telatin.mmb-dtp"),
+        ("jane@example.org", "jane_example.org"),
+        ("-weird name-", "weird_name"),
+        ("x" * 100, "x" * 63),
+        ("", "unknown"),
+        ("___", "unknown"),
+    ])
+    def test_sanitize_label_value(self, raw, expected):
+        assert sanitize_label_value(raw) == expected

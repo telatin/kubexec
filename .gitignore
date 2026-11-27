@@ -53,3 +53,4 @@ files.txt
 test.txt
 spades-out/
 !pytest.ini
+.e2e-work/

@@ -58,11 +58,37 @@ class TestMain:
 
     def test_list_jobs_without_target(self, run_cli, fake_k8s, capsys):
         assert run_cli("--list-jobs") == 0
-        assert "No kubexec jobs found" in capsys.readouterr().out
+        assert "No kubexec jobs of yours found" in capsys.readouterr().out
 
     def test_cleanup_old_without_target(self, run_cli, fake_k8s, capsys):
         assert run_cli("--cleanup-old", "24") == 0
         assert "Cleaned up 0 jobs" in capsys.readouterr().out
+
+    def test_jobs_commands_are_scoped_to_the_user_unless_all_users(self, run_cli, fake_k8s, monkeypatch):
+        monkeypatch.setenv("JUPYTERHUB_USER", "telatin.mmb-dtp")
+        list_jobs = fake_k8s.return_value.batch_v1.list_namespaced_job
+
+        run_cli("--list-jobs")
+        run_cli("--cleanup-old", "24")
+        assert [c.kwargs["label_selector"] for c in list_jobs.call_args_list] == [
+            "app=kubexec,kubexec-user=telatin.mmb-dtp"
+        ] * 2
+
+        list_jobs.reset_mock()
+        run_cli("--list-jobs", "--all-users")
+        run_cli("--cleanup-old", "24", "--all-users")
+        assert [c.kwargs["label_selector"] for c in list_jobs.call_args_list] == ["app=kubexec"] * 2
+
+    def test_all_users_listing_shows_owner_column(self, run_cli, fake_k8s, capsys):
+        job = MagicMock()
+        job.metadata.name = "kubexec-job-1"
+        job.metadata.labels = {"kubexec-user": "bob"}
+        job.status.succeeded = 1
+        job.spec.template.spec.containers = [MagicMock(image="alpine")]
+        fake_k8s.return_value.batch_v1.list_namespaced_job.return_value.items = [job]
+        assert run_cli("--list-jobs", "--all-users") == 0
+        out = capsys.readouterr().out
+        assert "USER" in out and "bob" in out
 
     def test_dry_run(self, run_cli, fake_k8s, capsys):
         assert run_cli("--dry-run", "-d", "alpine", "echo hi") == 0
@@ -75,6 +101,10 @@ class TestMain:
 
         run_cli("--dry-run", "echo hi", config_yaml="verify_ssl: false\n")
         assert fake_k8s.call_args.kwargs["verify_ssl"] is False
+
+    def test_workdir_option_selects_the_run_directory(self, run_cli, fake_k8s, capsys):
+        assert run_cli("--dry-run", "-w", "/shared/team/results", "echo hi") == 0
+        assert "cd /shared/team/results && echo hi" in capsys.readouterr().out
 
     def test_job_exit_code_is_propagated(self, run_cli, fake_k8s):
         fake_k8s.return_value.wait_for_job_completion.return_value = (3, "")

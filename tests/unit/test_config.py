@@ -3,6 +3,9 @@ import os
 import pytest
 
 from kubexec.config import Config
+
+ORIGINAL_FIND_CONFIG_FILE = Config._find_config_file
+SHIPPED_DEFAULT_DIRS = list(Config.DEFAULT_CONFIG_DIRS)
 from kubexec.exceptions import ConfigurationError
 
 
@@ -71,3 +74,50 @@ def test_valid_timeout_in_file(make_config, yaml_value, expected):
 def test_env_timeout_overrides_invalid_file_value(make_config, monkeypatch):
     monkeypatch.setenv("KUBEXEC_TIMEOUT", "60")
     assert make_config("timeout: abc\n").get("timeout") == 60
+
+
+class TestDefaultLocation:
+    @pytest.fixture(autouse=True)
+    def real_lookup(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(Config, "_find_config_file", ORIGINAL_FIND_CONFIG_FILE)
+        monkeypatch.setattr(Config, "_detect_namespace", lambda self: "test-ns")
+        self.home_config = tmp_path / "home" / ".config" / "kubexec"
+        monkeypatch.setattr(Config, "DEFAULT_CONFIG_DIRS", [str(self.home_config)])
+
+    def test_shipped_default_dir_is_in_the_home_directory(self):
+        assert SHIPPED_DEFAULT_DIRS == [os.path.join(os.path.expanduser("~"), ".config", "kubexec")]
+
+    def test_default_config_is_created_in_home_when_missing(self):
+        config = Config()
+        assert config.config_file == str(self.home_config / "config.yaml")
+        assert os.path.exists(config.config_file)
+        assert config.get("namespace") == "test-ns"
+
+    def test_existing_default_config_is_used(self):
+        self.home_config.mkdir(parents=True)
+        (self.home_config / "config.yaml").write_text("docker_image: alpine\n")
+        assert Config().get("docker_image") == "alpine"
+
+    def test_unwritable_location_falls_back_to_builtin_defaults(self, monkeypatch, tmp_path):
+        blocker = tmp_path / "a-file"
+        blocker.write_text("")
+        monkeypatch.setattr(Config, "DEFAULT_CONFIG_DIRS", [str(blocker / "kubexec")])
+        config = Config()
+        assert config.get("docker_image") == "ubuntu:latest"
+        assert config.get("namespace") == "test-ns"
+        assert not os.path.exists(config.config_file)
+
+
+class TestDefaultWorkdir:
+    def test_default_is_a_new_folder_per_run_for_each_user(self, config):
+        assert config.get("default_workdir") == "/shared/team/kubexec/work/{user}/{run}"
+
+    def test_file_and_env_override(self, make_config, monkeypatch):
+        assert make_config("default_workdir: /shared/team/mine\n").get("default_workdir") == "/shared/team/mine"
+        monkeypatch.setenv("KUBEXEC_DEFAULT_WORKDIR", "/shared/team/from-env/{user}")
+        assert make_config("default_workdir: /shared/team/mine\n").get("default_workdir") == "/shared/team/from-env/{user}"
+
+    @pytest.mark.parametrize("yaml_value", ["relative/path", "''", "null", "[1]"])
+    def test_must_be_an_absolute_path(self, make_config, yaml_value):
+        with pytest.raises(ConfigurationError, match="default_workdir"):
+            make_config(f"default_workdir: {yaml_value}\n")
