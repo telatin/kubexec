@@ -12,6 +12,8 @@ from rich import box
 from .config import Config
 from .k8s_client import KubernetesClient
 from .exceptions import KubeExecError
+from .templates import OWNER_LABEL
+from .utils import get_user_identity
 
 console = Console()
 
@@ -36,7 +38,8 @@ Examples:
   kuberlist                    # List all pods
   kuberlist --all              # List all pods with more details
   kuberlist --running          # Only running pods
-  kuberlist --kubexec          # Only kubexec jobs
+  kuberlist --kubexec          # Only your kubexec pods
+  kuberlist --kubexec --all-users  # Kubexec pods of every user
   kuberlist --watch            # Watch pod status changes
         """
     )
@@ -66,7 +69,18 @@ Examples:
     parser.add_argument(
         '--kubexec',
         action='store_true',
-        help='Show only kubexec jobs'
+        help='Show only your kubexec pods'
+    )
+    
+    parser.add_argument(
+        '--all-users',
+        action='store_true',
+        help="With --kubexec, show every user's kubexec pods in the namespace, not only yours"
+    )
+    
+    parser.add_argument(
+        '--config',
+        help='Configuration file (default: ~/.config/kubexec/config.yaml)'
     )
     
     parser.add_argument(
@@ -124,19 +138,28 @@ def get_status_color(status: str, restart_count: int = 0) -> str:
         return "white"
 
 
+def pod_selector(kubexec_only: bool, all_users: bool = False, user: Optional[str] = None) -> Optional[str]:
+    """Label selector for pods: none, all kubexec pods, or only the current user's"""
+    if not kubexec_only:
+        return None
+    selector = "app=kubexec"
+    if not all_users:
+        selector += f",{OWNER_LABEL}={user or get_user_identity()}"
+    return selector
+
+
 def list_pods(
     k8s_client: KubernetesClient,
     namespace: str,
     show_all: bool = False,
     running_only: bool = False,
-    kubexec_only: bool = False
+    kubexec_only: bool = False,
+    all_users: bool = False
 ) -> None:
-    """List pods in namespace"""
+    """List pods in namespace (with kubexec_only: the current user's unless all_users)"""
     try:
-        # Set up label selector
-        label_selector = None
-        if kubexec_only:
-            label_selector = "app=kubexec"
+        label_selector = pod_selector(kubexec_only, all_users)
+        show_user = kubexec_only and all_users
         
         pods = k8s_client.core_v1.list_namespaced_pod(
             namespace=namespace,
@@ -146,7 +169,7 @@ def list_pods(
         if not pods.items:
             filter_desc = ""
             if kubexec_only:
-                filter_desc = " kubexec"
+                filter_desc = " kubexec" if all_users else " kubexec (yours; use --all-users for everyone's)"
             elif running_only:
                 filter_desc = " running"
             console.print(f"[yellow]No{filter_desc} pods found in namespace '{namespace}'[/yellow]")
@@ -161,6 +184,8 @@ def list_pods(
         
         # Add columns
         table.add_column("NAME", style="bold", no_wrap=True)
+        if show_user:
+            table.add_column("USER")
         table.add_column("STATUS", justify="center")
         table.add_column("RESTARTS", justify="center")
         table.add_column("AGE", justify="center")
@@ -201,21 +226,20 @@ def list_pods(
                         parts = image.split('/')
                         image = '/'.join(parts[-2:]) if len(parts) > 1 else image[:30] + "..."
                 
-                table.add_row(
-                    name,
-                    status_text,
-                    Text(str(restart_count), style=restart_style),
-                    age,
-                    node,
-                    image
-                )
+                extra = [node, image]
             else:
-                table.add_row(
-                    name,
-                    status_text,
-                    Text(str(restart_count), style=restart_style),
-                    age
-                )
+                extra = []
+            
+            first = [name]
+            if show_user:
+                first.append((pod.metadata.labels or {}).get(OWNER_LABEL, 'unknown'))
+            table.add_row(
+                *first,
+                status_text,
+                Text(str(restart_count), style=restart_style),
+                age,
+                *extra
+            )
         
         console.print(table)
                 
@@ -226,7 +250,8 @@ def list_pods(
 def watch_pods(
     k8s_client: KubernetesClient,
     namespace: str,
-    kubexec_only: bool = False
+    kubexec_only: bool = False,
+    all_users: bool = False
 ) -> None:
     """Watch pod status changes"""
     import time
@@ -244,7 +269,7 @@ def watch_pods(
             console.print(f"[dim]Last updated: {timestamp}[/dim]")
             console.print()
             
-            list_pods(k8s_client, namespace, show_all=True, kubexec_only=kubexec_only)
+            list_pods(k8s_client, namespace, show_all=True, kubexec_only=kubexec_only, all_users=all_users)
             
             time.sleep(5)
             
@@ -262,16 +287,16 @@ def main() -> int:
     
     try:
         # Load configuration to get namespace
-        config = Config()
+        config = Config(args.config)
         namespace = args.namespace or config.get('namespace')
         
         # Initialize Kubernetes client
         k8s_client = KubernetesClient(args.context, verify_ssl=config.get('verify_ssl', True))
         
         if args.watch:
-            watch_pods(k8s_client, namespace, args.kubexec)
+            watch_pods(k8s_client, namespace, args.kubexec, args.all_users)
         else:
-            list_pods(k8s_client, namespace, args.all, args.running, args.kubexec)
+            list_pods(k8s_client, namespace, args.all, args.running, args.kubexec, args.all_users)
         
         return 0
         
